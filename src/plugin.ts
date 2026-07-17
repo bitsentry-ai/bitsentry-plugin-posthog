@@ -568,6 +568,15 @@ function buildHavingClause(input) {
     filters.push(`max(timestamp) <= ${quoteHogQLUtcDateTime64(input.until)}`);
   }
 
+  if (input.cursor !== undefined) {
+    const cursorTimestamp = quoteHogQLUtcDateTime64(input.cursor.timestamp);
+    filters.push(
+      `(last_seen < ${cursorTimestamp} OR ` +
+        `(last_seen = ${cursorTimestamp} AND ` +
+        `properties.$exception_fingerprint > ${quoteHogQLString(input.cursor.fingerprint)}))`,
+    );
+  }
+
   if (filters.length === 0) {
     return "";
   }
@@ -576,7 +585,6 @@ function buildHavingClause(input) {
 }
 
 function buildIssuesHogQL(input) {
-  const offset = input.offset ?? 0;
   return `SELECT
       properties.$exception_fingerprint AS fingerprint,
       argMax(properties.$exception_message, tuple(timestamp, uuid)) AS message,
@@ -595,12 +603,10 @@ function buildIssuesHogQL(input) {
     GROUP BY properties.$exception_fingerprint
     ${buildHavingClause(input)}
     ORDER BY last_seen DESC, fingerprint ASC
-    LIMIT ${String(input.limit + 1)}
-    OFFSET ${String(offset)}`;
+    LIMIT ${String(input.limit + 1)}`;
 }
 
 function buildEventsHogQL(input) {
-  const offset = input.offset ?? 0;
   const filters = [
     "event = '$exception'",
     `properties.$exception_fingerprint = ${quoteHogQLString(input.fingerprint)}`,
@@ -610,6 +616,13 @@ function buildEventsHogQL(input) {
   }
   if (readString(input.until).length > 0) {
     filters.push(`timestamp <= ${quoteHogQLUtcDateTime64(input.until)}`);
+  }
+  if (input.cursor !== undefined) {
+    const cursorTimestamp = quoteHogQLUtcDateTime64(input.cursor.timestamp);
+    filters.push(
+      `(timestamp < ${cursorTimestamp} OR ` +
+        `(timestamp = ${cursorTimestamp} AND uuid > ${quoteHogQLString(input.cursor.uuid)}))`,
+    );
   }
 
   return `SELECT
@@ -629,8 +642,7 @@ function buildEventsHogQL(input) {
     FROM events
     WHERE ${filters.join(" AND ")}
     ORDER BY timestamp DESC, uuid ASC
-    LIMIT ${String(input.limit + 1)}
-    OFFSET ${String(offset)}`;
+    LIMIT ${String(input.limit + 1)}`;
 }
 
 function parseHogQLResponse(payload) {
@@ -646,8 +658,8 @@ function parseHogQLResponse(payload) {
   };
 }
 
-function rowToObject(row, columns) {
-  const out = {};
+function rowToObject(row, columns): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
   for (let index = 0; index < columns.length; index += 1) {
     out[columns[index]] = row[index];
   }
@@ -898,16 +910,7 @@ function buildEventRecord(row) {
   };
 }
 
-function decodeOffsetCursor(cursor) {
-  const parsed = Number(readString(cursor));
-  if (Number.isFinite(parsed) && parsed >= 0) {
-    return Math.trunc(parsed);
-  }
-
-  return 0;
-}
-
-function decodePerProjectCursor(cursor) {
+function parseCursorRecord(cursor) {
   const raw = readString(cursor);
   if (raw.length === 0) {
     return {};
@@ -919,17 +922,54 @@ function decodePerProjectCursor(cursor) {
       return {};
     }
 
-    const out = {};
-    for (const [projectId, offset] of Object.entries(parsed)) {
-      const numeric = Number(offset);
-      if (Number.isFinite(numeric) && numeric >= 0) {
-        out[projectId] = Math.trunc(numeric);
-      }
-    }
-    return out;
+    return parsed;
   } catch {
     return {};
   }
+}
+
+function parseIssueCursor(value) {
+  const record = readRecord(value);
+  const timestamp = readString(record.timestamp);
+  const fingerprint = readString(record.fingerprint);
+  if (timestamp.length === 0 || fingerprint.length === 0) return undefined;
+  return { timestamp, fingerprint };
+}
+
+function parseEventCursor(value) {
+  const record = readRecord(value);
+  const timestamp = readString(record.timestamp);
+  const uuid = readString(record.uuid);
+  if (timestamp.length === 0 || uuid.length === 0) return undefined;
+  return { timestamp, uuid };
+}
+
+function decodePerProjectIssueCursor(cursor) {
+  const parsed = parseCursorRecord(cursor);
+  const out = {};
+  for (const [projectId, value] of Object.entries(parsed)) {
+    const parsedCursor = parseIssueCursor(value);
+    if (parsedCursor !== undefined) out[projectId] = parsedCursor;
+  }
+  return out;
+}
+
+function encodePerProjectIssueCursor(cursors) {
+  return JSON.stringify(cursors);
+}
+
+function decodePerProjectEventCursor(cursor) {
+  const parsed = parseCursorRecord(cursor);
+  const out = {};
+  for (const [projectId, value] of Object.entries(parsed)) {
+    const parsedCursor = parseEventCursor(value);
+    if (parsedCursor !== undefined) out[projectId] = parsedCursor;
+  }
+  return out;
+}
+
+function encodePerProjectEventCursor(cursors) {
+  return JSON.stringify(cursors);
 }
 
 function issueLastSeenTimestamp(issue) {
@@ -948,13 +988,16 @@ function issueLastSeenTimestamp(issue) {
 function mergeIssuesByRecency(perProjectResults, limit) {
   const tagged = [];
   const consumedByProject = new Map();
-  const nextOffsets = {};
+  const nextCursors = {};
   let anyHasMore = false;
 
   for (const result of perProjectResults) {
-    nextOffsets[result.projectId] = result.startOffset;
-    for (const issue of result.issues) {
-      tagged.push({ projectId: result.projectId, issue });
+    for (const item of result.issues) {
+      tagged.push({
+        projectId: result.projectId,
+        issue: item.issue,
+        cursor: item.cursor,
+      });
     }
   }
 
@@ -974,7 +1017,16 @@ function mergeIssuesByRecency(perProjectResults, limit) {
 
   for (const result of perProjectResults) {
     const consumed = consumedByProject.get(result.projectId) ?? 0;
-    nextOffsets[result.projectId] = result.startOffset + consumed;
+    const consumedItems = tagged
+      .filter((item) => item.projectId === result.projectId)
+      .slice(0, consumed);
+    const consumedCursor = consumedItems[consumed - 1]?.cursor;
+    const nextCursor =
+      consumedCursor ??
+      (consumed === 0 ? result.lastRawCursor : result.startCursor);
+    if (nextCursor !== undefined) {
+      nextCursors[result.projectId] = nextCursor;
+    }
     if (consumed < result.issues.length || result.hasMore) {
       anyHasMore = true;
     }
@@ -983,7 +1035,9 @@ function mergeIssuesByRecency(perProjectResults, limit) {
   return {
     issues: consumedSlice.map((item) => item.issue),
     hasMore: anyHasMore,
-    nextCursor: anyHasMore ? JSON.stringify(nextOffsets) : undefined,
+    nextCursor: anyHasMore
+      ? encodePerProjectIssueCursor(nextCursors)
+      : undefined,
   };
 }
 
@@ -1033,7 +1087,7 @@ async function runIssuesQuery({
   since,
   until,
   limit,
-  offset,
+  cursor,
 }) {
   const response = await runHogQLQuery({
     accessToken,
@@ -1045,19 +1099,33 @@ async function runIssuesQuery({
       since,
       until,
       limit,
-      offset,
+      cursor,
     }),
   });
 
   const columns = response.columns;
   const rawRows = response.results;
   const overFetched = rawRows.length > limit;
-  const issues = limitRows(rawRows, limit)
-    .map((row) => buildIssueRecord(rowToObject(row, columns)))
-    .filter((issue) => issue.id.length > 0);
+  const usableRows = limitRows(rawRows, limit);
+  let lastRawCursor;
+  const issues = usableRows
+    .map((row) => {
+      const raw = rowToObject(row, columns);
+      const fingerprint = readString(raw.fingerprint);
+      const timestamp = readString(raw.last_seen);
+      const rowCursor =
+        fingerprint.length > 0 && timestamp.length > 0
+          ? { timestamp, fingerprint }
+          : undefined;
+      if (rowCursor !== undefined) lastRawCursor = rowCursor;
+      const issue = buildIssueRecord(raw);
+      return { issue, cursor: rowCursor };
+    })
+    .filter((item) => item.issue.id.length > 0);
 
   return {
     issues,
+    lastRawCursor,
     hasMore: overFetched || response.hasMore,
   };
 }
@@ -1070,7 +1138,7 @@ async function runEventsQuery({
   since,
   until,
   limit,
-  offset,
+  cursor,
 }) {
   const response = await runHogQLQuery({
     accessToken,
@@ -1082,19 +1150,34 @@ async function runEventsQuery({
       since,
       until,
       limit,
-      offset,
+      cursor,
     }),
   });
 
   const columns = response.columns;
   const rawRows = response.results;
   const overFetched = rawRows.length > limit;
-  const events = limitRows(rawRows, limit)
-    .map((row) => buildEventRecord(rowToObject(row, columns)))
+  const usableRows = limitRows(rawRows, limit);
+  let nextCursor;
+  const events = usableRows
+    .map((row) => {
+      const raw = rowToObject(row, columns);
+      if (
+        readString(raw.timestamp).length > 0 &&
+        readString(raw.uuid).length > 0
+      ) {
+        nextCursor = {
+          timestamp: readString(raw.timestamp),
+          uuid: readString(raw.uuid),
+        };
+      }
+      return buildEventRecord(raw);
+    })
     .filter((event) => event.id.length > 0);
 
   return {
     events,
+    nextCursor,
     hasMore: overFetched || response.hasMore,
   };
 }
@@ -1208,10 +1291,10 @@ async function queryProjectIssues({ auth, input }) {
     };
   }
 
-  const offsets = decodePerProjectCursor(input.cursor);
+  const cursors = decodePerProjectIssueCursor(input.cursor);
   const perProjectResults = await Promise.all(
     projectIds.map(async (projectId) => {
-      const startOffset = offsets[projectId] ?? 0;
+      const startCursor = cursors[projectId];
       const result = await runIssuesQuery({
         accessToken,
         apiBase,
@@ -1220,9 +1303,9 @@ async function queryProjectIssues({ auth, input }) {
         since: input.since,
         until: input.until,
         limit,
-        offset: startOffset,
+        cursor: startCursor,
       });
-      return { projectId, startOffset, ...result };
+      return { projectId, startCursor, ...result };
     }),
   );
   const merged = mergeIssuesByRecency(perProjectResults, limit);
@@ -1239,7 +1322,7 @@ async function listIssueEvents({ auth, input }) {
   const apiBase = readApiBase(auth);
   const issueId = requireString(input.issueId, "issueId");
   const limit = boundedLimit(input.limit, DEFAULT_EVENTS_LIMIT);
-  const offset = decodeOffsetCursor(input.cursor);
+  const cursors = decodePerProjectEventCursor(input.cursor);
   const { projectId: scopedProjectId, fingerprint } =
     extractIssueFingerprint(issueId);
   let projectIds = readStringArray(input.projectIds);
@@ -1249,6 +1332,7 @@ async function listIssueEvents({ auth, input }) {
 
   const events = [];
   let hasMore = false;
+  const nextCursors = {};
   for (const projectId of projectIds) {
     const result = await runEventsQuery({
       accessToken,
@@ -1258,12 +1342,15 @@ async function listIssueEvents({ auth, input }) {
       since: input.since,
       until: input.until,
       limit,
-      offset,
+      cursor: cursors[projectId],
     });
     for (const event of result.events) {
       events.push(event);
     }
     hasMore = hasMore || result.hasMore;
+    if (result.nextCursor !== undefined) {
+      nextCursors[projectId] = result.nextCursor;
+    }
   }
 
   return {
@@ -1272,7 +1359,9 @@ async function listIssueEvents({ auth, input }) {
     data: {
       events,
       hasMore,
-      nextCursor: hasMore ? String(offset + limit) : undefined,
+      nextCursor: hasMore
+        ? encodePerProjectEventCursor(nextCursors)
+        : undefined,
     },
   };
 }
