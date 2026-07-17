@@ -137,6 +137,50 @@ describe("PostHog plugin package", () => {
       "Content-Type": "application/json",
     });
     expect(request?.redirect).toBe("error");
+    expect(JSON.parse(String(request?.body)).query.query).not.toContain(
+      "OFFSET",
+    );
+  });
+
+  it("uses keyset cursors for subsequent issue pages", async () => {
+    const fetchMock = vi
+      .fn<(url: string, request?: RequestInit) => Promise<Response>>()
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            columns: [
+              "fingerprint",
+              "message",
+              "exception_type",
+              "level",
+              "first_seen",
+              "last_seen",
+              "project_id",
+            ],
+            results: [],
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await action("query_issues").execute(
+      context({
+        projectIds: ["177710"],
+        cursor: JSON.stringify({
+          "177710": {
+            timestamp: "2026-05-12T04:55:40.560Z",
+            fingerprint: "fp-1",
+          },
+        }),
+      }),
+    );
+
+    const [, request] = fetchMock.mock.calls[0] ?? [];
+    const query = JSON.parse(String(request?.body)).query.query as string;
+    expect(query).toContain("last_seen < toDateTime64");
+    expect(query).toContain("properties.$exception_fingerprint >");
+    expect(query).not.toContain("OFFSET");
   });
 
   it("rejects unallowlisted custom PostHog origins", async () => {
