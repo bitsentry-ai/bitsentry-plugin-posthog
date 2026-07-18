@@ -183,6 +183,66 @@ describe("PostHog plugin package", () => {
     expect(query).not.toContain("OFFSET");
   });
 
+  it("aborts an in-flight HogQL request when the parent operation is cancelled", async () => {
+    const controller = new AbortController();
+    let requestSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      (_url: string, request?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestSignal = request?.signal ?? undefined;
+          requestSignal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted")),
+            {
+              once: true,
+            },
+          );
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = action("query_issues").execute({
+      ...context({ projectIds: ["177710"] }),
+      operation: { signal: controller.signal },
+    } as DesktopPluginCodeActionContext);
+
+    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+    controller.abort();
+
+    await expect(result).rejects.toThrow();
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
+  it("bounds concurrent per-project HogQL queries", async () => {
+    let activeRequests = 0;
+    let peakRequests = 0;
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          activeRequests += 1;
+          peakRequests = Math.max(peakRequests, activeRequests);
+          setTimeout(() => {
+            activeRequests -= 1;
+            resolve(
+              new Response(JSON.stringify({ columns: [], results: [] }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              }),
+            );
+          }, 5);
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      action("query_issues").execute(
+        context({ projectIds: ["one", "two", "three", "four"], limit: 1 }),
+      ),
+    ).resolves.toMatchObject({ status: 200 });
+
+    expect(peakRequests).toBeLessThanOrEqual(3);
+  });
+
   it("rejects unallowlisted custom PostHog origins", async () => {
     await expect(
       action("query_issues").execute({
