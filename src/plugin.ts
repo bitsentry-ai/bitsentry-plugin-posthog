@@ -1,4 +1,5 @@
 import type { DesktopCodePlugin } from "@bitsentry/plugin-sdk";
+import { Effect } from "effect";
 
 const DEFAULT_ISSUES_LIMIT = 50;
 const DEFAULT_EVENTS_LIMIT = 50;
@@ -11,6 +12,85 @@ const POSTHOG_BUILTIN_ALLOWED_HOSTS = new Set([
   "eu.posthog.com",
 ]);
 const POSTHOG_ALLOWED_BASE_URLS_ENV = "POSTHOG_ALLOWED_BASE_URLS";
+const POSTHOG_REQUEST_TIMEOUT_MS = 30_000;
+const POSTHOG_PROJECT_QUERY_CONCURRENCY = 3;
+
+type PluginOperationContext = {
+  signal?: AbortSignal;
+  deadlineAt?: number;
+};
+
+function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const activeSignals = signals.filter(
+    (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
+  );
+
+  if (signals.some((signal) => signal?.aborted === true)) {
+    abort();
+  } else {
+    for (const signal of activeSignals) {
+      signal.addEventListener("abort", abort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    dispose() {
+      for (const signal of activeSignals) {
+        signal.removeEventListener("abort", abort);
+      }
+    },
+  };
+}
+
+function operationTimeoutMs(operation?: PluginOperationContext): number {
+  if (typeof operation?.deadlineAt !== "number") {
+    return POSTHOG_REQUEST_TIMEOUT_MS;
+  }
+
+  return Math.max(
+    0,
+    Math.min(POSTHOG_REQUEST_TIMEOUT_MS, operation.deadlineAt - Date.now()),
+  );
+}
+
+function readOperationContext(context): PluginOperationContext | undefined {
+  return (context as { operation?: PluginOperationContext }).operation;
+}
+
+async function runPostHogRequest<T>(
+  operation: string,
+  parentOperation: PluginOperationContext | undefined,
+  execute: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const timeoutMs = operationTimeoutMs(parentOperation);
+
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: async (effectSignal) => {
+        const linkedSignal = linkAbortSignals([
+          parentOperation?.signal,
+          effectSignal,
+        ]);
+        try {
+          return await execute(linkedSignal.signal);
+        } finally {
+          linkedSignal.dispose();
+        }
+      },
+      catch: (cause) =>
+        cause instanceof Error ? cause : new Error(`${operation} failed`),
+    }).pipe(
+      Effect.timeoutFail({
+        duration: timeoutMs,
+        onTimeout: () =>
+          new Error(`${operation} timed out after ${String(timeoutMs)}ms`),
+      }),
+    ),
+  );
+}
 
 function readString(value, fallback = "") {
   if (typeof value === "string") {
@@ -297,39 +377,57 @@ function retryDelay(response, fallbackMs) {
   return fallbackMs;
 }
 
-function wait(delayMs) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, delayMs);
+function wait(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-async function requestPostHog(url, init, maxAttempts = 5) {
-  let attempt = 0;
-  let delayMs = 1_000;
+async function requestPostHog(url, init, maxAttempts = 5, operation) {
+  return runPostHogRequest("PostHog API request", operation, async (signal) => {
+    let attempt = 0;
+    let delayMs = 1_000;
 
-  while (attempt < maxAttempts) {
-    attempt += 1;
-    const response = await fetch(url, {
-      ...init,
-      redirect: "error",
-    });
-    if (response.ok) {
-      return response;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      const response = await fetch(url, {
+        ...init,
+        redirect: "error",
+        signal,
+      });
+      if (response.ok) {
+        return response;
+      }
+
+      const retryable = response.status === 429 || response.status >= 500;
+      if (!retryable || attempt >= maxAttempts) {
+        const body = await response.text().catch(() => "");
+        throw new Error(
+          `PostHog API ${String(response.status)}: ${parseErrorBody(body)}`,
+        );
+      }
+
+      await wait(retryDelay(response, delayMs), signal);
+      delayMs = Math.min(delayMs * 2, 30_000);
     }
 
-    const retryable = response.status === 429 || response.status >= 500;
-    if (!retryable || attempt >= maxAttempts) {
-      const body = await response.text().catch(() => "");
-      throw new Error(
-        `PostHog API ${String(response.status)}: ${parseErrorBody(body)}`,
-      );
-    }
-
-    await wait(retryDelay(response, delayMs));
-    delayMs = Math.min(delayMs * 2, 30_000);
-  }
-
-  throw new Error("PostHog API request failed after retries");
+    throw new Error("PostHog API request failed after retries");
+  });
 }
 
 function normalizeTokenResponse(payload) {
@@ -387,7 +485,8 @@ function buildAuthorizeUrl({ auth, input }) {
   };
 }
 
-async function exchangeCodeForToken({ auth, input }) {
+async function exchangeCodeForToken(context) {
+  const { auth, input } = context;
   const payload = new URLSearchParams({
     grant_type: "authorization_code",
     code: requireString(input.code, "code"),
@@ -400,11 +499,16 @@ async function exchangeCodeForToken({ auth, input }) {
     payload.set("client_secret", clientSecret);
   }
 
-  const response = await requestPostHog(oauthUrl(auth, "/oauth/token/"), {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: payload.toString(),
-  });
+  const response = await requestPostHog(
+    oauthUrl(auth, "/oauth/token/"),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: payload.toString(),
+    },
+    5,
+    readOperationContext(context),
+  );
 
   return {
     status: 200,
@@ -413,7 +517,8 @@ async function exchangeCodeForToken({ auth, input }) {
   };
 }
 
-async function refreshToken({ auth, input }) {
+async function refreshToken(context) {
+  const { auth, input } = context;
   const payload = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: requireString(input.refreshToken, "refreshToken"),
@@ -424,11 +529,16 @@ async function refreshToken({ auth, input }) {
     payload.set("client_secret", clientSecret);
   }
 
-  const response = await requestPostHog(oauthUrl(auth, "/oauth/token/"), {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: payload.toString(),
-  });
+  const response = await requestPostHog(
+    oauthUrl(auth, "/oauth/token/"),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: payload.toString(),
+    },
+    5,
+    readOperationContext(context),
+  );
 
   return {
     status: 200,
@@ -463,7 +573,7 @@ function resolveSameOriginNextUrl(nextUrl, apiBase) {
   return parsed.toString();
 }
 
-async function fetchAllPaginated(initialUrl, accessToken) {
+async function fetchAllPaginated(initialUrl, accessToken, operation) {
   const out = [];
   let nextUrl = initialUrl;
   let pageCount = 0;
@@ -476,9 +586,14 @@ async function fetchAllPaginated(initialUrl, accessToken) {
     }
     pageCount += 1;
 
-    const response = await requestPostHog(nextUrl, {
-      headers: authHeaders(accessToken),
-    });
+    const response = await requestPostHog(
+      nextUrl,
+      {
+        headers: authHeaders(accessToken),
+      },
+      5,
+      operation,
+    );
     const parsed = parsePaginatedResponse(await response.json());
     for (const row of parsed.results) {
       out.push(row);
@@ -568,6 +683,15 @@ function buildHavingClause(input) {
     filters.push(`max(timestamp) <= ${quoteHogQLUtcDateTime64(input.until)}`);
   }
 
+  if (input.cursor !== undefined) {
+    const cursorTimestamp = quoteHogQLUtcDateTime64(input.cursor.timestamp);
+    filters.push(
+      `(last_seen < ${cursorTimestamp} OR ` +
+        `(last_seen = ${cursorTimestamp} AND ` +
+        `properties.$exception_fingerprint > ${quoteHogQLString(input.cursor.fingerprint)}))`,
+    );
+  }
+
   if (filters.length === 0) {
     return "";
   }
@@ -576,7 +700,6 @@ function buildHavingClause(input) {
 }
 
 function buildIssuesHogQL(input) {
-  const offset = input.offset ?? 0;
   return `SELECT
       properties.$exception_fingerprint AS fingerprint,
       argMax(properties.$exception_message, tuple(timestamp, uuid)) AS message,
@@ -595,12 +718,10 @@ function buildIssuesHogQL(input) {
     GROUP BY properties.$exception_fingerprint
     ${buildHavingClause(input)}
     ORDER BY last_seen DESC, fingerprint ASC
-    LIMIT ${String(input.limit + 1)}
-    OFFSET ${String(offset)}`;
+    LIMIT ${String(input.limit + 1)}`;
 }
 
 function buildEventsHogQL(input) {
-  const offset = input.offset ?? 0;
   const filters = [
     "event = '$exception'",
     `properties.$exception_fingerprint = ${quoteHogQLString(input.fingerprint)}`,
@@ -610,6 +731,13 @@ function buildEventsHogQL(input) {
   }
   if (readString(input.until).length > 0) {
     filters.push(`timestamp <= ${quoteHogQLUtcDateTime64(input.until)}`);
+  }
+  if (input.cursor !== undefined) {
+    const cursorTimestamp = quoteHogQLUtcDateTime64(input.cursor.timestamp);
+    filters.push(
+      `(timestamp < ${cursorTimestamp} OR ` +
+        `(timestamp = ${cursorTimestamp} AND uuid > ${quoteHogQLString(input.cursor.uuid)}))`,
+    );
   }
 
   return `SELECT
@@ -629,8 +757,7 @@ function buildEventsHogQL(input) {
     FROM events
     WHERE ${filters.join(" AND ")}
     ORDER BY timestamp DESC, uuid ASC
-    LIMIT ${String(input.limit + 1)}
-    OFFSET ${String(offset)}`;
+    LIMIT ${String(input.limit + 1)}`;
 }
 
 function parseHogQLResponse(payload) {
@@ -646,8 +773,8 @@ function parseHogQLResponse(payload) {
   };
 }
 
-function rowToObject(row, columns) {
-  const out = {};
+function rowToObject(row, columns): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
   for (let index = 0; index < columns.length; index += 1) {
     out[columns[index]] = row[index];
   }
@@ -898,16 +1025,7 @@ function buildEventRecord(row) {
   };
 }
 
-function decodeOffsetCursor(cursor) {
-  const parsed = Number(readString(cursor));
-  if (Number.isFinite(parsed) && parsed >= 0) {
-    return Math.trunc(parsed);
-  }
-
-  return 0;
-}
-
-function decodePerProjectCursor(cursor) {
+function parseCursorRecord(cursor) {
   const raw = readString(cursor);
   if (raw.length === 0) {
     return {};
@@ -919,17 +1037,54 @@ function decodePerProjectCursor(cursor) {
       return {};
     }
 
-    const out = {};
-    for (const [projectId, offset] of Object.entries(parsed)) {
-      const numeric = Number(offset);
-      if (Number.isFinite(numeric) && numeric >= 0) {
-        out[projectId] = Math.trunc(numeric);
-      }
-    }
-    return out;
+    return parsed;
   } catch {
     return {};
   }
+}
+
+function parseIssueCursor(value) {
+  const record = readRecord(value);
+  const timestamp = readString(record.timestamp);
+  const fingerprint = readString(record.fingerprint);
+  if (timestamp.length === 0 || fingerprint.length === 0) return undefined;
+  return { timestamp, fingerprint };
+}
+
+function parseEventCursor(value) {
+  const record = readRecord(value);
+  const timestamp = readString(record.timestamp);
+  const uuid = readString(record.uuid);
+  if (timestamp.length === 0 || uuid.length === 0) return undefined;
+  return { timestamp, uuid };
+}
+
+function decodePerProjectIssueCursor(cursor) {
+  const parsed = parseCursorRecord(cursor);
+  const out = {};
+  for (const [projectId, value] of Object.entries(parsed)) {
+    const parsedCursor = parseIssueCursor(value);
+    if (parsedCursor !== undefined) out[projectId] = parsedCursor;
+  }
+  return out;
+}
+
+function encodePerProjectIssueCursor(cursors) {
+  return JSON.stringify(cursors);
+}
+
+function decodePerProjectEventCursor(cursor) {
+  const parsed = parseCursorRecord(cursor);
+  const out = {};
+  for (const [projectId, value] of Object.entries(parsed)) {
+    const parsedCursor = parseEventCursor(value);
+    if (parsedCursor !== undefined) out[projectId] = parsedCursor;
+  }
+  return out;
+}
+
+function encodePerProjectEventCursor(cursors) {
+  return JSON.stringify(cursors);
 }
 
 function issueLastSeenTimestamp(issue) {
@@ -948,13 +1103,16 @@ function issueLastSeenTimestamp(issue) {
 function mergeIssuesByRecency(perProjectResults, limit) {
   const tagged = [];
   const consumedByProject = new Map();
-  const nextOffsets = {};
+  const nextCursors = {};
   let anyHasMore = false;
 
   for (const result of perProjectResults) {
-    nextOffsets[result.projectId] = result.startOffset;
-    for (const issue of result.issues) {
-      tagged.push({ projectId: result.projectId, issue });
+    for (const item of result.issues) {
+      tagged.push({
+        projectId: result.projectId,
+        issue: item.issue,
+        cursor: item.cursor,
+      });
     }
   }
 
@@ -974,7 +1132,16 @@ function mergeIssuesByRecency(perProjectResults, limit) {
 
   for (const result of perProjectResults) {
     const consumed = consumedByProject.get(result.projectId) ?? 0;
-    nextOffsets[result.projectId] = result.startOffset + consumed;
+    const consumedItems = tagged
+      .filter((item) => item.projectId === result.projectId)
+      .slice(0, consumed);
+    const consumedCursor = consumedItems[consumed - 1]?.cursor;
+    const nextCursor =
+      consumedCursor ??
+      (consumed === 0 ? result.lastRawCursor : result.startCursor);
+    if (nextCursor !== undefined) {
+      nextCursors[result.projectId] = nextCursor;
+    }
     if (consumed < result.issues.length || result.hasMore) {
       anyHasMore = true;
     }
@@ -983,7 +1150,9 @@ function mergeIssuesByRecency(perProjectResults, limit) {
   return {
     issues: consumedSlice.map((item) => item.issue),
     hasMore: anyHasMore,
-    nextCursor: anyHasMore ? JSON.stringify(nextOffsets) : undefined,
+    nextCursor: anyHasMore
+      ? encodePerProjectIssueCursor(nextCursors)
+      : undefined,
   };
 }
 
@@ -999,7 +1168,13 @@ function extractIssueFingerprint(issueId) {
   };
 }
 
-async function runHogQLQuery({ accessToken, apiBase, projectId, hogQL }) {
+async function runHogQLQuery({
+  accessToken,
+  apiBase,
+  projectId,
+  hogQL,
+  operation,
+}) {
   const response = await requestPostHog(
     `${apiBase}/api/projects/${encodeURIComponent(projectId)}/query/`,
     {
@@ -1012,6 +1187,8 @@ async function runHogQLQuery({ accessToken, apiBase, projectId, hogQL }) {
         query: { kind: "HogQLQuery", query: hogQL },
       }),
     },
+    5,
+    operation,
   );
 
   return parseHogQLResponse(await response.json());
@@ -1033,7 +1210,8 @@ async function runIssuesQuery({
   since,
   until,
   limit,
-  offset,
+  cursor,
+  operation,
 }) {
   const response = await runHogQLQuery({
     accessToken,
@@ -1045,19 +1223,34 @@ async function runIssuesQuery({
       since,
       until,
       limit,
-      offset,
+      cursor,
     }),
+    operation,
   });
 
   const columns = response.columns;
   const rawRows = response.results;
   const overFetched = rawRows.length > limit;
-  const issues = limitRows(rawRows, limit)
-    .map((row) => buildIssueRecord(rowToObject(row, columns)))
-    .filter((issue) => issue.id.length > 0);
+  const usableRows = limitRows(rawRows, limit);
+  let lastRawCursor;
+  const issues = usableRows
+    .map((row) => {
+      const raw = rowToObject(row, columns);
+      const fingerprint = readString(raw.fingerprint);
+      const timestamp = readString(raw.last_seen);
+      const rowCursor =
+        fingerprint.length > 0 && timestamp.length > 0
+          ? { timestamp, fingerprint }
+          : undefined;
+      if (rowCursor !== undefined) lastRawCursor = rowCursor;
+      const issue = buildIssueRecord(raw);
+      return { issue, cursor: rowCursor };
+    })
+    .filter((item) => item.issue.id.length > 0);
 
   return {
     issues,
+    lastRawCursor,
     hasMore: overFetched || response.hasMore,
   };
 }
@@ -1070,7 +1263,8 @@ async function runEventsQuery({
   since,
   until,
   limit,
-  offset,
+  cursor,
+  operation,
 }) {
   const response = await runHogQLQuery({
     accessToken,
@@ -1082,29 +1276,47 @@ async function runEventsQuery({
       since,
       until,
       limit,
-      offset,
+      cursor,
     }),
+    operation,
   });
 
   const columns = response.columns;
   const rawRows = response.results;
   const overFetched = rawRows.length > limit;
-  const events = limitRows(rawRows, limit)
-    .map((row) => buildEventRecord(rowToObject(row, columns)))
+  const usableRows = limitRows(rawRows, limit);
+  let nextCursor;
+  const events = usableRows
+    .map((row) => {
+      const raw = rowToObject(row, columns);
+      if (
+        readString(raw.timestamp).length > 0 &&
+        readString(raw.uuid).length > 0
+      ) {
+        nextCursor = {
+          timestamp: readString(raw.timestamp),
+          uuid: readString(raw.uuid),
+        };
+      }
+      return buildEventRecord(raw);
+    })
     .filter((event) => event.id.length > 0);
 
   return {
     events,
+    nextCursor,
     hasMore: overFetched || response.hasMore,
   };
 }
 
-async function listOrganizations({ auth }) {
+async function listOrganizations(context) {
+  const { auth } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const apiBase = readApiBase(auth);
   const rows = await fetchAllPaginated(
     `${apiBase}/api/organizations/`,
     accessToken,
+    readOperationContext(context),
   );
   const organizations = rows.map((item) => {
     const record = unknownRecord(item) ?? {};
@@ -1122,7 +1334,8 @@ async function listOrganizations({ auth }) {
   };
 }
 
-async function listProjects({ auth, input }) {
+async function listProjects(context) {
+  const { auth, input } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const apiBase = readApiBase(auth);
   const url = new URL(`${apiBase}/api/projects/`);
@@ -1131,7 +1344,11 @@ async function listProjects({ auth, input }) {
     url.searchParams.set("organization_id", orgSlug);
   }
 
-  const rows = await fetchAllPaginated(url.toString(), accessToken);
+  const rows = await fetchAllPaginated(
+    url.toString(),
+    accessToken,
+    readOperationContext(context),
+  );
   const projects = rows.map((item) => {
     const record = unknownRecord(item) ?? {};
     const id = readString(record.id);
@@ -1150,7 +1367,8 @@ async function listProjects({ auth, input }) {
   };
 }
 
-async function getProject({ auth, input }) {
+async function getProject(context) {
+  const { auth, input } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const projectId = requireString(input.projectId, "projectId");
   const apiBase = readApiBase(auth);
@@ -1159,6 +1377,8 @@ async function getProject({ auth, input }) {
     {
       headers: authHeaders(accessToken),
     },
+    5,
+    readOperationContext(context),
   );
   const record = unknownRecord(await response.json()) ?? {};
   const id = readString(record.id, projectId);
@@ -1175,27 +1395,31 @@ async function getProject({ auth, input }) {
   };
 }
 
-async function queryIssues({ auth, input }) {
+async function queryIssues(context) {
+  const { auth, input } = context;
   return queryProjectIssues({
     auth,
     input: {
       ...input,
       searchQuery: normalizeSearchQuery(input.query),
     },
+    operation: readOperationContext(context),
   });
 }
 
-async function listIssues({ auth, input }) {
+async function listIssues(context) {
+  const { auth, input } = context;
   return queryProjectIssues({
     auth,
     input: {
       ...input,
       searchQuery: "",
     },
+    operation: readOperationContext(context),
   });
 }
 
-async function queryProjectIssues({ auth, input }) {
+async function queryProjectIssues({ auth, input, operation }) {
   const accessToken = requireString(auth.accessToken, "accessToken");
   const apiBase = readApiBase(auth);
   const projectIds = readStringArray(input.projectIds);
@@ -1208,22 +1432,28 @@ async function queryProjectIssues({ auth, input }) {
     };
   }
 
-  const offsets = decodePerProjectCursor(input.cursor);
-  const perProjectResults = await Promise.all(
-    projectIds.map(async (projectId) => {
-      const startOffset = offsets[projectId] ?? 0;
-      const result = await runIssuesQuery({
-        accessToken,
-        apiBase,
-        projectId,
-        searchQuery: input.searchQuery,
-        since: input.since,
-        until: input.until,
-        limit,
-        offset: startOffset,
-      });
-      return { projectId, startOffset, ...result };
-    }),
+  const cursors = decodePerProjectIssueCursor(input.cursor);
+  const perProjectResults = await Effect.runPromise(
+    Effect.forEach(
+      projectIds,
+      (projectId) =>
+        Effect.tryPromise(async () => {
+          const startCursor = cursors[projectId];
+          const result = await runIssuesQuery({
+            accessToken,
+            apiBase,
+            projectId,
+            searchQuery: input.searchQuery,
+            since: input.since,
+            until: input.until,
+            limit,
+            cursor: startCursor,
+            operation,
+          });
+          return { projectId, startCursor, ...result };
+        }),
+      { concurrency: POSTHOG_PROJECT_QUERY_CONCURRENCY },
+    ),
   );
   const merged = mergeIssuesByRecency(perProjectResults, limit);
 
@@ -1234,12 +1464,13 @@ async function queryProjectIssues({ auth, input }) {
   };
 }
 
-async function listIssueEvents({ auth, input }) {
+async function listIssueEvents(context) {
+  const { auth, input } = context;
   const accessToken = requireString(auth.accessToken, "accessToken");
   const apiBase = readApiBase(auth);
   const issueId = requireString(input.issueId, "issueId");
   const limit = boundedLimit(input.limit, DEFAULT_EVENTS_LIMIT);
-  const offset = decodeOffsetCursor(input.cursor);
+  const cursors = decodePerProjectEventCursor(input.cursor);
   const { projectId: scopedProjectId, fingerprint } =
     extractIssueFingerprint(issueId);
   let projectIds = readStringArray(input.projectIds);
@@ -1249,6 +1480,7 @@ async function listIssueEvents({ auth, input }) {
 
   const events = [];
   let hasMore = false;
+  const nextCursors = {};
   for (const projectId of projectIds) {
     const result = await runEventsQuery({
       accessToken,
@@ -1258,12 +1490,16 @@ async function listIssueEvents({ auth, input }) {
       since: input.since,
       until: input.until,
       limit,
-      offset,
+      cursor: cursors[projectId],
+      operation: readOperationContext(context),
     });
     for (const event of result.events) {
       events.push(event);
     }
     hasMore = hasMore || result.hasMore;
+    if (result.nextCursor !== undefined) {
+      nextCursors[projectId] = result.nextCursor;
+    }
   }
 
   return {
@@ -1272,7 +1508,9 @@ async function listIssueEvents({ auth, input }) {
     data: {
       events,
       hasMore,
-      nextCursor: hasMore ? String(offset + limit) : undefined,
+      nextCursor: hasMore
+        ? encodePerProjectEventCursor(nextCursors)
+        : undefined,
     },
   };
 }
