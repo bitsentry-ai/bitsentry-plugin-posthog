@@ -1,4 +1,5 @@
 import type { DesktopCodePlugin } from "@bitsentry/plugin-sdk";
+import { Effect } from "effect";
 
 const DEFAULT_ISSUES_LIMIT = 50;
 const DEFAULT_EVENTS_LIMIT = 50;
@@ -11,6 +12,28 @@ const POSTHOG_BUILTIN_ALLOWED_HOSTS = new Set([
   "eu.posthog.com",
 ]);
 const POSTHOG_ALLOWED_BASE_URLS_ENV = "POSTHOG_ALLOWED_BASE_URLS";
+const POSTHOG_REQUEST_TIMEOUT_MS = 30_000;
+
+async function runPostHogRequest<T>(
+  operation: string,
+  execute: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  return Effect.runPromise(
+    Effect.tryPromise({
+      try: execute,
+      catch: (cause) =>
+        cause instanceof Error ? cause : new Error(`${operation} failed`),
+    }).pipe(
+      Effect.timeoutFail({
+        duration: POSTHOG_REQUEST_TIMEOUT_MS,
+        onTimeout: () =>
+          new Error(
+            `${operation} timed out after ${String(POSTHOG_REQUEST_TIMEOUT_MS)}ms`,
+          ),
+      }),
+    ),
+  );
+}
 
 function readString(value, fallback = "") {
   if (typeof value === "string") {
@@ -297,39 +320,57 @@ function retryDelay(response, fallbackMs) {
   return fallbackMs;
 }
 
-function wait(delayMs) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, delayMs);
+function wait(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
 async function requestPostHog(url, init, maxAttempts = 5) {
-  let attempt = 0;
-  let delayMs = 1_000;
+  return runPostHogRequest("PostHog API request", async (signal) => {
+    let attempt = 0;
+    let delayMs = 1_000;
 
-  while (attempt < maxAttempts) {
-    attempt += 1;
-    const response = await fetch(url, {
-      ...init,
-      redirect: "error",
-    });
-    if (response.ok) {
-      return response;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      const response = await fetch(url, {
+        ...init,
+        redirect: "error",
+        signal,
+      });
+      if (response.ok) {
+        return response;
+      }
+
+      const retryable = response.status === 429 || response.status >= 500;
+      if (!retryable || attempt >= maxAttempts) {
+        const body = await response.text().catch(() => "");
+        throw new Error(
+          `PostHog API ${String(response.status)}: ${parseErrorBody(body)}`,
+        );
+      }
+
+      await wait(retryDelay(response, delayMs), signal);
+      delayMs = Math.min(delayMs * 2, 30_000);
     }
 
-    const retryable = response.status === 429 || response.status >= 500;
-    if (!retryable || attempt >= maxAttempts) {
-      const body = await response.text().catch(() => "");
-      throw new Error(
-        `PostHog API ${String(response.status)}: ${parseErrorBody(body)}`,
-      );
-    }
-
-    await wait(retryDelay(response, delayMs));
-    delayMs = Math.min(delayMs * 2, 30_000);
-  }
-
-  throw new Error("PostHog API request failed after retries");
+    throw new Error("PostHog API request failed after retries");
+  });
 }
 
 function normalizeTokenResponse(payload) {
