@@ -22,7 +22,7 @@ type PluginOperationContext = {
 
 function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
   const controller = new AbortController();
-  const abort = () => controller.abort();
+  const abort = () => { controller.abort(); };
   const activeSignals = signals.filter(
     (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
   );
@@ -386,7 +386,11 @@ function wait(delayMs: number, signal: AbortSignal): Promise<void> {
     const onAbort = () => {
       clearTimeout(timeoutId);
       signal.removeEventListener("abort", onAbort);
-      reject(signal.reason);
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Operation cancelled"),
+      );
     };
 
     if (signal.aborted) {
