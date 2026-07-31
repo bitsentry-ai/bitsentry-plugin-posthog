@@ -137,7 +137,7 @@ describe("PostHog plugin package", () => {
       "Content-Type": "application/json",
     });
     expect(request?.redirect).toBe("error");
-    expect(JSON.parse(String(request?.body)).query.query).not.toContain(
+    expect(JSON.parse(request?.body as string).query.query).not.toContain(
       "OFFSET",
     );
   });
@@ -177,7 +177,7 @@ describe("PostHog plugin package", () => {
     );
 
     const [, request] = fetchMock.mock.calls[0] ?? [];
-    const query = JSON.parse(String(request?.body)).query.query as string;
+    const query = JSON.parse(request?.body as string).query.query as string;
     expect(query).toContain("last_seen < toDateTime64");
     expect(query).toContain("properties.$exception_fingerprint >");
     expect(query).not.toContain("OFFSET");
@@ -192,7 +192,7 @@ describe("PostHog plugin package", () => {
           requestSignal = request?.signal ?? undefined;
           requestSignal?.addEventListener(
             "abort",
-            () => reject(new Error("aborted")),
+            () => { reject(new Error("aborted")); },
             {
               once: true,
             },
@@ -206,7 +206,7 @@ describe("PostHog plugin package", () => {
       operation: { signal: controller.signal },
     } as DesktopPluginCodeActionContext);
 
-    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+    await vi.waitFor(() => { expect(requestSignal).toBeDefined(); });
     controller.abort();
 
     await expect(result).rejects.toThrow();
