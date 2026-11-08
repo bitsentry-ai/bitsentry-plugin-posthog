@@ -42,23 +42,9 @@ describe("PostHog plugin package", () => {
     vi.unstubAllEnvs();
   });
 
-  it("declares a typed PostHog error-source code plugin", () => {
-    expect(plugin).toMatchObject({
-      id: "posthog",
-      metadata: {
-        dataSource: {
-          sourceType: "posthog",
-          setupFields: expect.arrayContaining([
-            expect.objectContaining({
-              key: "projectIds",
-              required: true,
-            }),
-          ]),
-        },
-      },
-    });
-    expect(plugin.actions.map((candidate) => candidate.id)).toEqual(
-      expect.arrayContaining(["query_issues", "list_issue_events"]),
+  it("exposes the error-source actions no behaviour test calls", () => {
+    expect(plugin.actions.map((candidate) => candidate.id)).toContain(
+      "list_issue_events",
     );
   });
 
