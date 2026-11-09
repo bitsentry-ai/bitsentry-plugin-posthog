@@ -29,7 +29,7 @@ function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]) {
     (signal): signal is AbortSignal => signal !== undefined && !signal.aborted,
   );
 
-  if (signals.some((signal) => signal?.aborted === true)) {
+  if (signals.some((signal) => signal?.aborted)) {
     abort();
   } else {
     for (const signal of activeSignals) {
@@ -404,7 +404,7 @@ function wait(delayMs: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-async function requestPostHog(url, init, maxAttempts = 5, operation) {
+async function requestPostHog(url, init, maxAttempts, operation) {
   return runPostHogRequest("PostHog API request", operation, async (signal) => {
     let attempt = 0;
     let delayMs = 1_000;
